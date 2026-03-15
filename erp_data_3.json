@@ -1,0 +1,8 @@
+[
+    {"id": "SKU-001", "title": "Kávovar Espresso", "price_vat_excl": 13400.5, "stocks": {"praha": 5, "brno": 3}, "attributes": {"color": "stříbrná"}},
+    {"id": "SKU-002", "title": "Moka konvička", "price_vat_excl": 650.0, "stocks": {"praha": 10}, "attributes": {}},
+    {"id": "SKU-003", "title": "Mlýnek", "price_vat_excl": 1500, "stocks": {"externi": 50}, "attributes": null},
+    {"id": "SKU-004", "title": "Hrnek", "price_vat_excl": 200, "stocks": {"praha": 10}, "attributes": {"color": "černá"}},
+    {"id": "SKU-005", "title": "V-60", "price_vat_excl": 0, "stocks": {"praha": 0}, "attributes": {"color": "šedá"}},
+    {"id": "SKU-006", "title": "Tablety", "price_vat_excl": 250, "stocks": {}, "attributes": {}},
+    {"id": "SKU-007", "title": "Káva", "price_vat_excl": 100, "stocks": null, "attributes": {}}]
