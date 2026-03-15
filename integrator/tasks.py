@@ -63,6 +63,7 @@ def validate_items(data):
 
 
 def transform_erp_data(data):
+    # WEAK SPOT TO FIX: What if there are 2 different prices/titles/attributes for one SKU? (code will take the last one)
     transformed_data = {}
     
     for item in data:
@@ -80,7 +81,6 @@ def transform_erp_data(data):
                 }
             }
     
-        # Potential error: What if there are 2 different prices for one SKU? (code will take the last one)
         price = item.get('price_vat_excl')
         if price is not None and price > 0:
             transformed_data[sku_id]['price_vat'] = price * 1.21 
