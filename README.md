@@ -34,7 +34,13 @@ Run the containers.
 Detached mode (recommended):
 
 ```bash
-docker compose up -d
+docker compose up -d 
+```
+
+Or:
+
+```bash
+docker compose up --build -d
 ```
 
 Or run with logs visible:
