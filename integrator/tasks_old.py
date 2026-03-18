@@ -3,13 +3,13 @@ import time
 import hashlib
 import requests
 
-from .eshop_api_con import API_URL, headers, RATE_LIMIT, REQUEST_DELAY
-from .erp_data_quality import validate_items, consistent_items
 from unittest.mock import patch, Mock
 from collections import defaultdict
 from celery import shared_task
 from django.conf import settings
 from .models import ProductSync, DataQualityLog
+from .eshop_api_con import API_URL, headers, RATE_LIMIT, REQUEST_DELAY
+from .erp_data_quality import validate_items, consistent_items
 
 def get_erp_data(file_name):
     try:
@@ -20,10 +20,13 @@ def get_erp_data(file_name):
         raise Exception("ERP file not found")
 
 
+
 def transform_erp_data(data):
+    
     transformed_data = {}
     
     for item in data:
+        print(item)
         sku_id = item['id']
     
         if sku_id not in transformed_data:
@@ -37,10 +40,11 @@ def transform_erp_data(data):
                     'color': (item.get("attributes") or {}).get("color") or "N/A"
                 }
             }
+        
         # Add VAT to price_vat_excl and save it variable price_vat
         price = item.get('price_vat_excl')
         if price is not None and price > 0:
-            transformed_data[sku_id]['price_vat'] = price * 1.21 
+            transformed_data[sku_id]['price_vat'] = price * 1.21
         elif price is None or price == 0:
             transformed_data[sku_id]['price_vat'] = None
             
@@ -64,36 +68,38 @@ def get_hash(data):
         hashes[sku_id] = {'data_hash':hashlib.sha256(json_data.encode("utf-8")).hexdigest()}
     return hashes
 
-def preprocess_erp_data(erp_data): 
-    # -----------------------------
-    # Validate ERP data
-    # -----------------------------
-    valid_data, invalid_data = validate_items(erp_data) 
-    valid_data, inconsistencies = consistent_items(valid_data)
-    dqf_input = invalid_data | inconsistencies
-    # -----------------------------
-    # Transform valid data
-    # -----------------------------
-    transformed = transform_erp_data(valid_data)
-    # -----------------------------
-    # Hash invalid/inconsistent data
-    # -----------------------------
-    transformed_hash = get_hash(transformed)
-    dqf_input_hash = get_hash(dqf_input)
-    # -----------------------------
-    # Save invalid/inconsistent items to DB
-    # -----------------------------
-    for id_sku in dqf_input:
-        product_hash = dqf_input_hash[id_sku].get('data_hash')
-        db_dq, created = DataQualityLog.objects.get_or_create(
-                sku = id_sku,
-                defaults = {"data_hash": product_hash})
-        db_dq.data_hash = product_hash
-        db_dq.data_dict = dqf_input[id_sku]
-        db_dq.error_message = dqf_input[id_sku].get('error_message')
-        db_dq.save()
-        
-    return transformed, transformed_hash
+
+@shared_task(bind=True, rate_limit=f'1/s', autoretry_for=(requests.exceptions.Timeout,),
+             retry_backoff=True, retry_kwargs={'max_retries': 10})
+def send_request(self, method, url, headers, product_json):
+    # Function sends request POST/PATCH, if it fails with code 429, repeat until succsess or max retries
+    
+    response = requests.request(
+            method,
+            url,
+            json=product_json,
+            headers=headers,
+            timeout=5)
+    
+    if response.status_code == 429:
+        raise self.retry(countdown=1)
+      
+    if response.status_code in (200, 201):
+        ProductSync.objects.update_or_create(
+            sku=sku_id,
+            defaults={
+                'data_dict': product_json,
+                'data_hash': hashlib.sha256(json.dumps(product_json, sort_keys=True).encode()).hexdigest()
+            }
+        )
+    
+    if response.status_code == 201:
+        print(id_sku, " was created.")
+    elif response.status_code == 200:
+        print(id_sku, " was updated.")
+    
+    return response
+
 
 def get_mock(method):
     
@@ -115,20 +121,34 @@ def get_mock(method):
         mock.raise_for_status.side_effect = requests.HTTPError("429 Too Many Requests")
         
     return mock
-
+        
     
-@shared_task(bind=True, rate_limit="1/s", autoretry_for=(requests.exceptions.RequestException,), retry_backoff=True, retry_kwargs={'max_retries': 10})
-def sync_products(self, file_name):
-    # -----------------------------
-    # Load, validate and transform ERP data
-    # -----------------------------
-    transformed, transformed_hash = preprocess_erp_data(get_erp_data(file_name))
+@shared_task
+def sync_products(file_name):
+    # Data quality check
+    valid_data, invalid_data = validate_items(get_erp_data(file_name)) 
+    valid_data, inconsistencies = consistent_items(valid_data)
+    dqf_input = invalid_data | inconsistencies
+    # Validated data transformation
+    transformed = transform_erp_data(valid_data)
+    # Hash valid data
+    transformed_hash = get_hash(transformed)
+    # Hash invalid data
+    dqf_input_hash = get_hash(dqf_input)
+    print(dqf_input)
+    # Save information about invalid and inconsistent items to db
+    for id_sku in dqf_input:
+        product_hash = dqf_input_hash[id_sku].get('data_hash')
+        db_dq, created = DataQualityLog.objects.get_or_create(
+                sku = id_sku,
+                defaults = {"data_hash": product_hash})
+        db_dq.data_hash = product_hash
+        db_dq.data_dict = dqf_input[id_sku]
+        db_dq.error_message = dqf_input[id_sku].get('error_message')
+        db_dq.save()
     
-    
-    # -----------------------------
-    # Send POST/PATCH requests with Celery + Mock
-    # -----------------------------
-    fail_count = 0
+    # POST/PATCH valid items to ESHOP API
+    fail_count = 0 # for 429 response testing
     for id_sku in transformed:        
         product_dict = transformed[id_sku]
         product_hash = transformed_hash[id_sku].get('data_hash')        
@@ -142,11 +162,18 @@ def sync_products(self, file_name):
         if not created and db_obj.data_hash == product_hash:
             print(id_sku, " was not updated.")
             continue
-                  
-        method = "POST" if created else "PATCH"
-        url = f"{API_URL}/products/" if created else f"{API_URL}/products/{id_sku}/"
+            
         
-        # Determine whether to fail this request (simulate 429)
+        # If it is not created => POST
+        if created:
+            method = "POST"
+            url = f"{API_URL}/products/"
+        # If it is created => PATCH
+        else:
+            method = "PATCH"
+            url = f"{API_URL}/products/{id_sku}/"
+        
+        # Block for Mocking API calls 
         fail_count += 1    
         if fail_count in [2, 5, 6, 7]:
             mock_list = [get_mock('FAIL'), get_mock(method)]
@@ -154,23 +181,10 @@ def sync_products(self, file_name):
             mock_list = [get_mock('FAIL'),get_mock('FAIL'),get_mock('FAIL'), get_mock(method)]
         else:
             mock_list = [get_mock(method)]
-        # Send requests
-        with patch("requests.request", side_effect=mock_list):
-            response = requests.request(
-            method,
-            url,
-            json=product_dict,
-            headers=headers)
-          
-            if response.status_code == 429:
-                print(f"429 for {id_sku}, retrying...")
-                raise self.retry(countdown=1)
         
-            # Update DB if successful
-            if response.status_code in (200, 201):
-                db_obj.data_hash = product_hash
-                db_obj.data_dict = product_dict
-                db_obj.save()
-                print(id_sku, "created" if response.status_code == 201 else "updated")
+        # Send requests
+        with patch("requests.request", side_effect = mock_list):
+            response = send_request.delay(method, url, headers, product_dict)
+    
 
     return "Sync_product DONE."
