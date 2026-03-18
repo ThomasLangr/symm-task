@@ -2,14 +2,24 @@ import json
 import time
 import hashlib
 import requests
-
+import random
 from .eshop_api_con import API_URL, headers, RATE_LIMIT, REQUEST_DELAY
 from .erp_data_quality import validate_items, consistent_items
 from unittest.mock import patch, Mock
 from collections import defaultdict
-from celery import shared_task
+from celery import shared_task, group
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
 from .models import ProductSync, DataQualityLog
+
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MockResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
 
 def get_erp_data(file_name):
     try:
@@ -83,94 +93,83 @@ def preprocess_erp_data(erp_data):
     # -----------------------------
     # Save invalid/inconsistent items to DB
     # -----------------------------
-    for id_sku in dqf_input:
-        product_hash = dqf_input_hash[id_sku].get('data_hash')
+    for sku_id in dqf_input:
+        product_hash = dqf_input_hash[sku_id].get('data_hash')
         db_dq, created = DataQualityLog.objects.get_or_create(
-                sku = id_sku,
+                sku = sku_id,
                 defaults = {"data_hash": product_hash})
         db_dq.data_hash = product_hash
-        db_dq.data_dict = dqf_input[id_sku]
-        db_dq.error_message = dqf_input[id_sku].get('error_message')
+        db_dq.data_dict = dqf_input[sku_id]
+        db_dq.error_message = dqf_input[sku_id].get('error_message')
         db_dq.save()
         
     return transformed, transformed_hash
 
-def get_mock(method):
-    
-    if method == 'POST':
-        mock = Mock()
-        mock.status_code = 201
-        mock.json.return_value = {"result": f"success"}
-        mock.raise_for_status.return_value = None
-        
-    elif method == 'PATCH':
-        mock = Mock()
-        mock.status_code = 200
-        mock.json.return_value = {"result": f"success"}
-        mock.raise_for_status.return_value = None
-        
-    elif method == 'FAIL':
-        mock = Mock()
-        mock.status_code = 429
-        mock.raise_for_status.side_effect = requests.HTTPError("429 Too Many Requests")
-        
-    return mock
 
-    
+
 @shared_task(bind=True, rate_limit="1/s", autoretry_for=(requests.exceptions.RequestException,), retry_backoff=True, retry_kwargs={'max_retries': 10})
-def sync_products(self, file_name):
-    # -----------------------------
-    # Load, validate and transform ERP data
-    # -----------------------------
-    transformed, transformed_hash = preprocess_erp_data(get_erp_data(file_name))
+def sync_single_sku(self, sku_id, product_dict, sku_hash, MOCK_API=True):
+    try:
+        # Check if SKU exists
+        db_obj = ProductSync.objects.get(sku=sku_id)
+        sku_exists = True
+    except ProductSync.DoesNotExist:
+        db_obj = None
+        sku_exists = False
     
+    if sku_exists:
+        # SKU exists — update only if hash changed
+        if db_obj.data_hash == sku_hash:
+            print(f"{sku_id} exists and hash matches — nothing to do.")
+            return
+        method = "PATCH"
+        url = f"{API_URL}/products/{sku_id}/"
+    else:
+        # SKU does not exist — create
+        method = "POST"
+        url = f"{API_URL}/products/"
     
-    # -----------------------------
-    # Send POST/PATCH requests with Celery + Mock
-    # -----------------------------
-    fail_count = 0
-    for id_sku in transformed:        
-        product_dict = transformed[id_sku]
-        product_hash = transformed_hash[id_sku].get('data_hash')        
-    
-        # Check if id_sku already exists
-        db_obj, created = ProductSync.objects.get_or_create(
-                sku = id_sku,
-                defaults = {"data_hash": product_hash})
-        
-        # If item exists and it is the same, skip to next item.
-        if not created and db_obj.data_hash == product_hash:
-            print(id_sku, " was not updated.")
-            continue
-                  
-        method = "POST" if created else "PATCH"
-        url = f"{API_URL}/products/" if created else f"{API_URL}/products/{id_sku}/"
-        
-        # Determine whether to fail this request (simulate 429)
-        fail_count += 1    
-        if fail_count in [2, 5, 6, 7]:
-            mock_list = [get_mock('FAIL'), get_mock(method)]
-        elif fail_count == 4:
-            mock_list = [get_mock('FAIL'),get_mock('FAIL'),get_mock('FAIL'), get_mock(method)]
+    if MOCK_API:
+        if random.random() < 0.5:  # 10% chance
+            response = MockResponse(429)
+        elif not sku_exists:
+            response = MockResponse(201)
         else:
-            mock_list = [get_mock(method)]
-        # Send requests
-        with patch("requests.request", side_effect=mock_list):
-            response = requests.request(
-            method,
-            url,
-            json=product_dict,
-            headers=headers)
+            response = MockResponse(200)
+    else:
+        response = requests.request(method, url, json=product_dict, headers=headers)
+    
+    if response.status_code == 429:
+        logger.info(f"{sku_id}: got 429, retrying...")
+        raise self.retry(countdown=1)  # wait 1 second before retry
           
-            if response.status_code == 429:
-                print(f"429 for {id_sku}, retrying...")
-                raise self.retry(countdown=1)
-        
-            # Update DB if successful
-            if response.status_code in (200, 201):
-                db_obj.data_hash = product_hash
-                db_obj.data_dict = product_dict
-                db_obj.save()
-                print(id_sku, "created" if response.status_code == 201 else "updated")
+    if response.status_code == 201: 
+        ProductSync.objects.create(sku=sku_id, data_hash = sku_hash, data_dict = product_dict)
+    elif response.status_code == 200:
+        db_obj.data_hash = sku_hash
+        db_obj.data_dict = product_dict
+        db_obj.save()
+    
 
+@shared_task  
+def sync_products(file_name):
+    """
+    Main orchestration task: loads ERP data, transforms it, and dispatches per-SKU tasks.
+    """
+    # Step 1: Load and preprocess ERP data (CPU-bound, synchronous)
+    transformed, transformed_hash = preprocess_erp_data(get_erp_data(file_name))
+
+    if not transformed:
+        logger.warning("No SKUs found in file.")
+        return "No SKUs to sync."
+        
+    # Step 2: Dispatch a Celery task per SKU
+    job = group(
+        sync_single_sku.s(sku_id, transformed[sku_id], transformed_hash[sku_id]['data_hash'])
+        for sku_id in transformed
+    )
+    job.apply_async()
+    
+    logger.info(f"Dispatched {len(transformed)} SKU tasks for {file_name}.")
     return "Sync_product DONE."
+
