@@ -7,7 +7,7 @@
 
 ---
 
-# task.py description:
+# integrator.task.py description:
 1. Extract: get_erp_data() reads ERP JSON exports and loads them into Python structures.
 2. Validation: erp_data_quality.py consist of two functions validate_items, consistent_items to separate valid and invalid records
 3. Transformation: transform_erp_data() converts valid data from ERP into format of the e-shop API, calculates VAT price, aggregates stock and normalizes attributes.
@@ -16,6 +16,11 @@
 6. Synchronization: Products are sent to the external API using POST (create) or PATCH (update).
 7. Retry Logic: send_request() retries API calls when HTTP 429 rate limits occur.
 8. Persistence: ProductSync stores the last synchronized product data and hashes.
+
+---
+
+# test_dqf_tranform.py description:
+* basic test of data quality "filter" and transfomation
 
 ---
 
