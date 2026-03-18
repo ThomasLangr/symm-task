@@ -1,4 +1,23 @@
-# symm-task
+# symmy-task
+
+---
+
+* The `sync_products` task reads ERP JSON files and synchronizes products with the e-shop API.
+* Different dataset names (e.g., `erp_data`, `erp_data_2`, `erp_data_3`) allow testing multiple import scenarios.
+
+---
+
+# task.py description:
+1. Extract: get_erp_data() reads ERP JSON exports and loads them into Python structures.
+2. Validation: erp_data_quality.py consist of two functions validate_items, consistent_items to separate valid and invalid records
+3. Transformation: transform_erp_data() converts valid data from ERP into format of the e-shop API, calculates VAT price, aggregates stock and normalizes attributes.
+4. Change Detection: get_hash() generates SHA256 hashes of product data and compares them with stored hashes to avoid unnecessary updates.
+5. Data Quality Logging: invalid items are stored in the DataQualityLog model with error messages.
+6. Synchronization: Products are sent to the external API using POST (create) or PATCH (update).
+7. Retry Logic: send_request() retries API calls when HTTP 429 rate limits occur.
+8. Persistence: ProductSync stores the last synchronized product data and hashes.
+
+---
 
 # Product Integrator – Setup & Run Guide
 
@@ -106,21 +125,4 @@ docker compose down
 
 ---
 
-# Notes
 
-* The `sync_products` task reads ERP JSON files and synchronizes products with the e-shop API.
-* Different dataset names (e.g., `erp_data`, `erp_data_2`) allow testing multiple import scenarios.
-* Make sure the ERP JSON files exist in the expected location before running the sync.
-
-
-# task.py description:
-1. Extract: get_erp_data() reads ERP JSON exports and loads them into Python structures.
-2. Validation: validate_items() checks schema and business rules and separates valid and invalid
-records. (TO-DO: Consistency check)
-3. Transformation: transform_erp_data() converts valid data in ERP format into the e-shop API model, calculates VAT price, aggregates stock and normalizes attributes.
-4. Change Detection: get_hash() generates SHA256 hashes of product data and compares them
-with stored hashes to avoid unnecessary updates.
-5. Data Quality Logging: invalid items are stored in the DataQualityLog model with error messages.
-6. Synchronization: Products are sent to the external API using POST (create) or PATCH (update).
-7. Retry Logic: send_request() retries API calls when HTTP 429 rate limits occur.
-8. Persistence: ProductSync stores the last synchronized product data and hashes.
