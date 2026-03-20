@@ -36,6 +36,7 @@ integrator/ # Main app
 * erp_data_quality.py # ERP validation & consistency logic (validate_items, consistent_items)
 * eshop_api_con.py # API header
 
+/ # data, test, configuration
 * manage.py
 * pytest.ini # test_dqf_transform
 * requirements.txt
